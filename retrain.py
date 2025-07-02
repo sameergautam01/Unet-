@@ -39,7 +39,8 @@ LOSS_NAMES.append('BCEWithLogitsLoss')
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--name', default=None, help='model name')
+    parser.add_argument('--name', default=None, help='model name (folder in models/)')
+    parser.add_argument('--checkpoint', default=None, help='path to model checkpoint to load')
     parser.add_argument('--epochs', default=100, type=int)
     parser.add_argument('-b', '--batch_size', default=2, type=int)
     parser.add_argument('--arch', '-a', default='NestedUNet', choices=ARCH_NAMES)
@@ -74,6 +75,7 @@ def compute_f1(outputs, targets, threshold=0.5):
     preds_bin = (probs > threshold).int()
     targets_bin = targets.int()  # Convert targets to int (0 or 1)
     return f1_score(targets_bin.view(-1).cpu().numpy(), preds_bin.view(-1).cpu().numpy(), zero_division=1)
+
 
 def get_system_stats():
     cpu_percent = psutil.cpu_percent(interval=1)
@@ -130,7 +132,7 @@ def validate_one_epoch(config, val_loader, model, criterion):
 
 def main():
     config = vars(parse_args())
-    config['name'] = config['name'] or f"{config['dataset']}_{config['arch']}_woDS"
+    config['name'] = config['name'] or f"{config['dataset']}_{config['arch']}_retrain"
     os.makedirs(f"models/{config['name']}", exist_ok=True)
     with open(f"models/{config['name']}/config.yml", 'w') as f:
         yaml.dump(config, f)
@@ -152,15 +154,15 @@ def main():
     else:
         optimizer = optim.SGD(params, lr=config['lr'], momentum=config['momentum'], nesterov=config['nesterov'], weight_decay=config['weight_decay'])
 
-    # Scheduler
-    if config['scheduler'] == 'CosineAnnealingLR':
-        scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=config['epochs'], eta_min=config['min_lr'])
-    elif config['scheduler'] == 'ReduceLROnPlateau':
-        scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, factor=config['factor'], patience=config['patience'], verbose=True, min_lr=config['min_lr'])
-    elif config['scheduler'] == 'MultiStepLR':
-        scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=[int(e) for e in config['milestones'].split(',')], gamma=config['gamma'])
-    else:
-        scheduler = None
+    start_epoch = 0
+    best_iou = 0
+
+    # Load checkpoint if provided
+    if config['checkpoint'] is not None and os.path.isfile(config['checkpoint']):
+        print(f"Loading checkpoint from {config['checkpoint']} ...")
+        checkpoint = torch.load(config['checkpoint'])
+        model.load_state_dict(checkpoint)
+        print("Checkpoint loaded.")
 
     img_ids = [os.path.splitext(os.path.basename(p))[0] for p in glob(os.path.join('inputs', config['dataset'], 'images', '*' + config['img_ext']))]
     train_ids, val_ids = train_test_split(img_ids, test_size=0.2, random_state=41)
@@ -197,21 +199,11 @@ def main():
                                              num_workers=config['num_workers'])
 
     log = OrderedDict([(k, []) for k in ['epoch', 'lr', 'loss', 'iou', 'f1', 'val_loss', 'val_iou', 'val_f1']])
-    best_iou = 0
 
-    for epoch in range(config['epochs']):
+    for epoch in range(start_epoch, config['epochs']):
         print(f"Epoch {epoch + 1}/{config['epochs']}")
         train_log = train_one_epoch(config, train_loader, model, criterion, optimizer)
         val_log = validate_one_epoch(config, val_loader, model, criterion)
-
-        # Scheduler step
-        if scheduler:
-            if config['scheduler'] == 'ReduceLROnPlateau':
-                scheduler.step(val_log['loss'])
-            else:
-                scheduler.step()
-
-        cpu_percent, ram_percent, gpu_stats = get_system_stats()
 
         for k in ['loss', 'iou', 'f1']:
             log[k].append(train_log[k])
@@ -227,16 +219,13 @@ def main():
             f.write(f"Epoch {epoch + 1}/{config['epochs']}\n")
             f.write(f"Train Loss: {train_log['loss']:.4f}, IoU: {train_log['iou']:.4f}, F1: {train_log['f1']:.4f}\n")
             f.write(f"Val   Loss: {val_log['loss']:.4f}, IoU: {val_log['iou']:.4f}, F1: {val_log['f1']:.4f}\n")
-            f.write(f"CPU Usage: {cpu_percent:.1f}%, RAM Usage: {ram_percent:.1f}%\n")
-            for g in gpu_stats:
-                f.write(f"GPU {g['id']} ({g['name']}): Load {g['load']:.1f}%, Mem {g['memoryUtil']:.1f}%\n")
             f.write("-" * 40 + "\n")
 
-        # Save best model
+        # Save best retrained model
         if val_log['iou'] > best_iou:
-            torch.save(model.state_dict(), f"models/{config['name']}/model.pth")
+            torch.save(model.state_dict(), f"models/{config['name']}/model_retrained.pth")
             best_iou = val_log['iou']
-            print("=> saved best model")
+            print("=> saved best retrained model")
 
         torch.cuda.empty_cache()
 
